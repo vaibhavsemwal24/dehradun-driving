@@ -214,12 +214,8 @@
 <div id="mapFail" class="overlay scrim hidden"><div class="dlg">
   <h3>Real streets could not be downloaded</h3>
   <p id="failWhy"></p>
-  <p>Two ways to get the real map:</p>
-  <ol>
-    <li>Download this game's HTML file and open it from your computer. It can then fetch the map itself.</li>
-    <li>Or go to openstreetmap.org, zoom to the part of Dehradun you want, choose Export, and load the downloaded .osm file here.</li>
-  </ol>
-  <div class="btns"><button class="btn pri" id="failFile">Load a map file</button><button class="btn" id="failSketch">Drive the sketch map</button><button class="btn" id="failBack">Back</button></div>
+  <p>You can also go to openstreetmap.org, zoom to the part of Dehradun you want, choose Export, and load the downloaded .osm file here.</p>
+  <div class="btns"><button class="btn pri" id="failRetry">Try again</button><button class="btn" id="failFile">Load a map file</button><button class="btn" id="failSketch">Drive the sketch map</button><button class="btn" id="failBack">Back</button></div>
 </div></div>
 
 <div id="pause" class="overlay scrim hidden"><div class="dlg">
@@ -566,27 +562,63 @@ function osmToMap(elements, lat0, lon0, label, clip) {
 }
 
 // ---- downloading real streets tile by tile (works when this file is opened directly; a hosted preview page may block it) ----
-const OVERPASS = ['https://overpass-api.de/api/interpreter', 'https://overpass.kumi.systems/api/interpreter', 'https://overpass.private.coffee/api/interpreter'];
+const OVERPASS = [
+  ['overpass-api.de', 'https://overpass-api.de/api/interpreter'],
+  ['private.coffee', 'https://overpass.private.coffee/api/interpreter'],
+  ['kumi.systems', 'https://overpass.kumi.systems/api/interpreter'],
+  ['mail.ru', 'https://maps.mail.ru/osm/tools/overpass/api/interpreter'],
+];
 const TILE_LAT = .018, TILE_LON = .0208; // about 2 km x 2 km
 const tileOf = (lat, lon) => [Math.floor(lat / TILE_LAT), Math.floor(lon / TILE_LON)];
 const tileKey = (i, j) => i + ':' + j;
-async function fetchTile(i, j, onStatus) {
-  const bb = [i * TILE_LAT, j * TILE_LON, (i + 1) * TILE_LAT, (j + 1) * TILE_LON].map(v => v.toFixed(5)).join(',');
-  const q = `[out:json][timeout:60][bbox:${bb}];(way["highway"~"^(motorway|trunk|primary|secondary|tertiary|unclassified|residential|living_street|service|road|motorway_link|trunk_link|primary_link|secondary_link|tertiary_link)$"];way["building"];way["leisure"~"^(park|garden|pitch|playground|stadium|golf_course)$"];way["landuse"~"^(forest|grass|meadow|recreation_ground|village_green|orchard|cemetery|reservoir|basin)$"];way["natural"~"^(water|wood|scrub|grassland)$"];way["waterway"];node["highway"="traffic_signals"];node["name"]["junction"];node["name"]["amenity"];node["name"]["shop"];node["name"]["office"];node["name"]["craft"];node["name"]["tourism"];node["name"]["railway"="station"];node["name"]["place"];node["name"]["historic"];);out geom qt;`;
-  let lastErr = null;
-  for (let k = 0; k < OVERPASS.length; k++) {
-    try {
-      onStatus && onStatus(k ? 'First map server did not answer. Trying another one.' : 'Asking OpenStreetMap for the roads, shops and buildings.');
-      const ctl = typeof AbortController !== 'undefined' ? new AbortController() : null, to = setTimeout(() => ctl && ctl.abort(), 80000);
-      const res = await fetch(OVERPASS[k], { method: 'POST', body: 'data=' + encodeURIComponent(q), headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, signal: ctl ? ctl.signal : undefined });
-      clearTimeout(to);
-      if (!res.ok) throw new Error('Map server answered with error ' + res.status + '.');
-      const data = await res.json();
-      if (!data.elements) throw new Error('The map server sent back nothing.');
-      return data.elements;
-    } catch (e) { lastErr = e; }
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+let goodServer = 0, buildingsPausedUntil = 0; // start with whichever server answered last time
+// Downloaded tiles are kept in the browser (IndexedDB), so a second visit loads instantly and needs no map server.
+const tileDB = (() => {
+  let dbp = null;
+  const open = () => dbp || (dbp = new Promise((res, rej) => { try { const r = indexedDB.open('doon-drive-tiles', 1); r.onupgradeneeded = () => r.result.createObjectStore('t'); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); } catch (e) { rej(e); } }));
+  const tx = (mode, fn) => open().then(db => new Promise((res, rej) => { const t = db.transaction('t', mode), q = fn(t.objectStore('t')); t.oncomplete = () => res(q && q.result); t.onerror = () => rej(t.error); }));
+  return { get: k => tx('readonly', st => st.get(k)).catch(() => null), put: (k, v) => tx('readwrite', st => st.put(v, k)).catch(() => null) };
+})();
+async function overpass(q, what, onStatus, timeoutMs, rounds = 2) {
+  const errs = [];
+  for (let round = 0; round < rounds; round++) {
+    for (let n = 0; n < OVERPASS.length; n++) {
+      const k = (goodServer + n) % OVERPASS.length, [name, url] = OVERPASS[k];
+      onStatus && onStatus(errs.length ? `${errs[errs.length - 1]}. Trying ${name} instead.` : `Downloading ${what} from OpenStreetMap.`);
+      const ctl = typeof AbortController !== 'undefined' ? new AbortController() : null, to = setTimeout(() => ctl && ctl.abort(), timeoutMs);
+      try {
+        const res = await fetch(url, { method: 'POST', body: 'data=' + encodeURIComponent(q), headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, signal: ctl ? ctl.signal : undefined });
+        if (!res.ok) throw new Error(res.status === 429 ? `${name} says too many requests` : res.status === 504 || res.status === 503 ? `${name} is busy` : `${name} answered error ${res.status}`);
+        const data = await res.json();
+        if (!data.elements) throw new Error(`${name} sent back nothing`);
+        if (data.remark && /runtime error|timed out|out of memory/i.test(data.remark) && !data.elements.length) throw new Error(`${name} ran out of time`);
+        goodServer = k;
+        return data.elements;
+      } catch (e) {
+        errs.push(e.name === 'AbortError' ? `${name} did not answer in time` : /Failed to fetch|NetworkError|Load failed/i.test(e.message) ? `${name} could not be reached` : e.message);
+      } finally { clearTimeout(to); }
+    }
+    if (round < rounds - 1) { onStatus && onStatus('All map servers are busy. Waiting a few seconds, then trying again.'); await sleep(4000); }
   }
-  throw lastErr || new Error('No map server could be reached.');
+  const err = new Error(errs.slice(-OVERPASS.length).join('; ')); err.list = errs; throw err;
+}
+// Roads, names and signals first (small, needed to drive); building outlines second (big, optional).
+async function fetchTile(i, j, onStatus) {
+  const key = 'v2:' + tileKey(i, j), cached = await tileDB.get(key);
+  if (cached && cached.els) { onStatus && onStatus('Loading saved streets.'); return cached.els; }
+  const bb = [i * TILE_LAT, j * TILE_LON, (i + 1) * TILE_LAT, (j + 1) * TILE_LON].map(v => v.toFixed(5)).join(',');
+  const core = `[out:json][timeout:90][bbox:${bb}];(way["highway"~"^(motorway|trunk|primary|secondary|tertiary|unclassified|residential|living_street|service|road|motorway_link|trunk_link|primary_link|secondary_link|tertiary_link)$"];way["leisure"~"^(park|garden|pitch|playground|stadium|golf_course)$"];way["landuse"~"^(forest|grass|meadow|recreation_ground|village_green|orchard|cemetery|reservoir|basin)$"];way["natural"~"^(water|wood|scrub|grassland)$"];way["waterway"];way["building"]["name"];node["highway"="traffic_signals"];node["name"]["junction"];node["name"]["amenity"];node["name"]["shop"];node["name"]["office"];node["name"]["craft"];node["name"]["tourism"];node["name"]["railway"="station"];node["name"]["place"];node["name"]["historic"];);out geom qt;`;
+  const blds = `[out:json][timeout:120][bbox:${bb}];way["building"];out geom qt;`;
+  const els = await overpass(core, 'the roads and shop names', onStatus, 60000);
+  let full = Date.now() > buildingsPausedUntil;
+  if (full) try {
+    const b = await overpass(blds, 'the building outlines', onStatus, 90000, 1);
+    const seen = new Set(els.map(e => e.type[0] + e.id)); for (const e of b) if (!seen.has(e.type[0] + e.id)) els.push(e);
+  } catch (e) { full = false; buildingsPausedUntil = Date.now() + 180000; }
+  if (full) tileDB.put(key, { els, t: Date.now() });
+  els.noBuildings = !full;
+  return els;
 }
 
 // ====================================================================
@@ -2812,6 +2844,7 @@ async function startNet(pl) {
     }
     $('loadMsg').textContent = 'Building the streets, chowks and shop boards in 3D.'; await nextFrame();
     buildRegion(0, 0, true); state.osmOk = true;
+    if ([...STREAM.tiles.values()].some(t => t.noBuildings)) STREAM.note = 'Building outlines could not be downloaded, so the buildings are generated.';
   } finally { state.busy = false; hideLoader(); }
 }
 function streamTick(dt) {
@@ -2833,7 +2866,10 @@ function streamTick(dt) {
   }
 }
 function showFail(e) {
-  $('failWhy').textContent = state.osmOk === false ? 'This page is not allowed to connect to the OpenStreetMap servers, so the map could not be fetched from here.' : 'The map servers did not answer (' + (e && e.message ? e.message : 'network error') + '). Check your internet connection and try again.';
+  const why = e && e.message ? e.message : 'network error';
+  $('failWhy').textContent = /could not be reached/.test(why) && !/busy|in time|too many|error/.test(why)
+    ? 'This page could not connect to any OpenStreetMap server (' + why + '). Check your internet connection. Some ad blockers and office networks block these servers.'
+    : 'The free OpenStreetMap servers are busy right now (' + why + '). This usually clears in a few minutes, so try again shortly. Once an area loads, it is saved on this device and loads instantly next time.';
   $('mapFail').classList.remove('hidden');
 }
 async function handleFile(file) {
@@ -2881,6 +2917,7 @@ async function startGame() {
   hudTick = 0; camera.position.set(P.x, 2, P.y);
   toast(MAP.kind === 'osm' ? MAP.label + ': ' + mapSummary(MAP) : pl[0] + '. ' + traffic.label + '.');
   toastT = MAP.kind === 'osm' ? 6 : 2.6;
+  if (MAP.kind === 'osm' && STREAM.note) { setTimeout(() => toast(STREAM.note), 6500); STREAM.note = ''; }
 }
 // ====================================================================
 //  INPUT & UI
@@ -2939,6 +2976,7 @@ click('pSound', () => { state.sound = !state.sound; $('pSound').textContent = 'S
 click('goBtn', startGame);
 click('fileBtn', () => $('fileIn').click()); click('failFile', () => $('fileIn').click());
 $('fileIn').addEventListener('change', e => { handleFile(e.target.files && e.target.files[0]); e.target.value = ''; });
+click('failRetry', () => { $('mapFail').classList.add('hidden'); startGame(); });
 click('failSketch', () => { $('mapFail').classList.add('hidden'); setSource('sketch'); startGame(); }); click('failBack', () => $('mapFail').classList.add('hidden'));
 window.addEventListener('dragover', e => e.preventDefault());
 window.addEventListener('drop', e => { e.preventDefault(); if (!state.running && e.dataTransfer && e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]); });
@@ -2996,7 +3034,7 @@ activateMap(SKETCH); buildMountains(); buildSky(); initPeds(); setQuality(qualit
 hourCache = hourNow(); traffic = trafficInfo(hourCache); dark = darknessAt(hourCache); applyTimeOfDay();
 buildVehicleCards(); setSource('sketch');
 // Can this page reach OpenStreetMap? (A hosted preview usually cannot; the file opened from disk can.)
-if (typeof fetch === 'function') fetch(OVERPASS[0].replace('interpreter', 'status'), { mode: 'no-cors' }).then(() => { state.osmOk = true; if (!state.running) setSource('osm'); }).catch(() => { state.osmOk = false; $('srcOsm').classList.add('off'); $('srcOsmNote').textContent = 'This page cannot reach OpenStreetMap. Download the game file and open it from your computer, or load a map file below.'; });
+if (typeof fetch === 'function') fetch(OVERPASS[0][1].replace('interpreter', 'status'), { mode: 'no-cors' }).then(() => { state.osmOk = true; if (!state.running) setSource('osm'); }).catch(() => { state.osmOk = false; $('srcOsm').classList.add('off'); $('srcOsmNote').textContent = 'This page cannot reach OpenStreetMap. Download the game file and open it from your computer, or load a map file below.'; });
 if (document.fonts && document.fonts.ready) document.fonts.ready.then(() => { redrawAllBoards(); setTimeout(redrawAllBoards, 1500); });
 requestAnimationFrame(frame);
 window.__doon = { HOARDINGS: () => HOARDINGS, nearestRoad, CHOWKS: () => CHOWKS, SIGNAL_CHOWKS: () => SIGNAL_CHOWKS, BOARDS: () => BOARDS, POOLS: () => POOLS, sigState, STREAM, buildRegion, updateBoards, VT, PLAYER_VEH, buildVehicleParts, mergeParts, P, state, keys, startGame, npcs: () => npcs, peds: () => peds, scene, crash, repair, toggleCam, setQuality, activateMap, osmToMap, parseOsmXml, placeNear, fillInitial, map: () => MAP, stats: () => ({ roads: ROADS.length, galis: GALI_ROADS.length, edges: EDGES.length, buildings: BUILDINGS.length, parked: PARKED.length }) };
